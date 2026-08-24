@@ -1,13 +1,18 @@
-"""SAP SuccessFactors Recruiting OData v2 Integration Client.
+"""SAP SuccessFactors Recruiting OData v2 Integration Client (Phase 1 & Phase 2).
 
 Provides reusable functions to copy a candidate's resume snapshot
-from the Candidate profile to a Job Application with write-once guard.
+from the Candidate profile to Job Applications with write-once guard,
+supporting single-application copy as well as scheduled batch processing
+with watermark management and CSV auditing.
 """
 
+import csv
+from datetime import datetime, timezone
 import json
 import logging
+import os
 import re
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -56,7 +61,7 @@ class SFClient:
         session.headers.update({
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "SF-Resume-Snapshot-Integration/1.0",
+            "User-Agent": "SF-Resume-Snapshot-Integration/2.0",
         })
 
         # Set Authentication
@@ -148,7 +153,7 @@ class SFClient:
 
 
 # ============================================================================
-# Reusable Integration Functions
+# Phase 1: Core Atomic Functions
 # ============================================================================
 
 def parse_attachment_id(raw_response_or_key: Any) -> str:
@@ -208,6 +213,32 @@ def parse_attachment_id(raw_response_or_key: Any) -> str:
     raise ValueError(f"Could not parse a valid Attachment ID from: '{raw_response_or_key}'")
 
 
+def is_attachment_populated(raw_val: Any) -> Tuple[bool, Optional[str]]:
+    """Determine if a custom attachment field value is populated and return parsed ID if available."""
+    if raw_val is None:
+        return False, None
+    
+    if isinstance(raw_val, dict):
+        if "__deferred" in raw_val:
+            return False, None
+        if raw_val.get("attachmentId"):
+            return True, str(raw_val.get("attachmentId"))
+        if raw_val.get("fileContent") or raw_val.get("fileName"):
+            return True, str(raw_val.get("attachmentId", "EXISTS"))
+        return False, None
+
+    if isinstance(raw_val, (int, str)):
+        s = str(raw_val).strip()
+        if s and s not in ("0", "null", "None", "false", "False"):
+            try:
+                aid = parse_attachment_id(s)
+                return True, aid
+            except Exception:
+                return True, s
+
+    return False, None
+
+
 def get_candidate_resume(
     candidate_id: str,
     client: Optional[SFClient] = None,
@@ -229,9 +260,6 @@ def get_candidate_resume(
           "candidateId": str
         }
       Or None if candidate has no resume or fileContent is null/empty.
-      
-    Raises:
-      RuntimeError: If candidate is not found or API returns an error status.
     """
     sf = client or SFClient()
     cand_id_str = str(candidate_id).strip()
@@ -254,7 +282,6 @@ def get_candidate_resume(
     data = resp.json()
     results = data.get("d", {}).get("results", [])
     if not results:
-        # Check single entity format d (if direct key was returned)
         d_obj = data.get("d", {})
         if d_obj.get("candidateId") == cand_id_str or str(d_obj.get("candidateId")) == cand_id_str:
             results = [d_obj]
@@ -269,7 +296,6 @@ def get_candidate_resume(
         logger.info("Candidate %s exists but has no resume navigation object.", cand_id_str)
         return None
 
-    # In SF OData, resume might be wrapped in {'results': [...]} if multi-valued, or direct dict
     if isinstance(resume_obj, dict) and "results" in resume_obj:
         res_list = resume_obj.get("results", [])
         resume_obj = res_list[0] if res_list else None
@@ -278,7 +304,6 @@ def get_candidate_resume(
         logger.info("Candidate %s has empty resume record.", cand_id_str)
         return None
 
-    # Check for binary content
     file_content = resume_obj.get("fileContent") or resume_obj.get("attachmentContent")
     if not file_content:
         logger.info("Candidate %s has resume metadata but empty fileContent.", cand_id_str)
@@ -314,29 +339,13 @@ def get_application_snapshot_status(
     client: Optional[SFClient] = None,
     target_field: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Check whether JobApplication.Cust_Candidate_Resume is already populated.
-    
-    This acts as the write-once guard check before creating or linking any attachments.
-    
-    Returns:
-      Dict with keys:
-        - "application_id": str
-        - "candidate_id": Optional[str]
-        - "is_populated": bool (True if Cust_Candidate_Resume is already set)
-        - "current_attachment_id": Optional[str] (Parsed attachment ID if already set)
-        - "raw_value": Any
-    """
+    """Check whether JobApplication.Cust_Candidate_Resume is already populated."""
     sf = client or SFClient()
     application_id_str = str(app_id).strip()
     field_name = target_field or sf.config.target_resume_field
 
-    logger.info(
-        "Checking snapshot status for JobApplication %s (Target field: %s)",
-        application_id_str,
-        field_name,
-    )
+    logger.info("Checking snapshot status for JobApplication %s (Target field: %s)", application_id_str, field_name)
 
-    # We can query JobApplication('{app_id}') or filter by applicationId
     endpoint = f"JobApplication('{application_id_str}')"
     params = {
         "$select": f"applicationId,candidateId,{field_name}",
@@ -345,7 +354,6 @@ def get_application_snapshot_status(
 
     resp = sf.request("GET", endpoint, params=params)
 
-    # Fallback to $filter query if single key syntax returns 404 or not found
     if resp.status_code == 404:
         logger.debug("Direct key access returned 404. Trying filter query for JobApplication %s", application_id_str)
         endpoint = "JobApplication"
@@ -373,27 +381,7 @@ def get_application_snapshot_status(
     candidate_id = str(app_record.get("candidateId") or "")
     raw_custom_resume = app_record.get(field_name)
 
-    is_populated = False
-    current_attachment_id = None
-
-    if raw_custom_resume is not None:
-        # Check if it's an expanded Attachment navigation object
-        if isinstance(raw_custom_resume, dict):
-            if "__deferred" in raw_custom_resume:
-                # If deferred and not null, we check if direct property had an ID or query attachment
-                pass
-            elif raw_custom_resume.get("attachmentId"):
-                is_populated = True
-                current_attachment_id = str(raw_custom_resume.get("attachmentId"))
-            elif raw_custom_resume.get("fileContent") or raw_custom_resume.get("fileName"):
-                is_populated = True
-                current_attachment_id = str(raw_custom_resume.get("attachmentId", "EXISTS"))
-        elif isinstance(raw_custom_resume, (int, str)) and str(raw_custom_resume).strip() not in ("", "0", "null", "None"):
-            is_populated = True
-            try:
-                current_attachment_id = parse_attachment_id(raw_custom_resume)
-            except Exception:
-                current_attachment_id = str(raw_custom_resume)
+    is_populated, current_attachment_id = is_attachment_populated(raw_custom_resume)
 
     logger.info(
         "Application %s Snapshot Status: is_populated=%s, current_attachment_id=%s",
@@ -417,14 +405,7 @@ def upload_attachment(
     module: str = "RECRUITING",
     client: Optional[SFClient] = None,
 ) -> str:
-    """Create a new independent Attachment entity in SAP SuccessFactors.
-    
-    POST /odata/v2/Attachment
-    Payload: { "fileName": filename, "fileContent": base64_content, "module": "RECRUITING", "viewable": true }
-    
-    Returns:
-      Plain string Attachment ID (e.g. "123456")
-    """
+    """Create a new independent Attachment entity in SAP SuccessFactors."""
     sf = client or SFClient()
     if not base64_content:
         raise ValueError("base64_content must not be empty.")
@@ -458,7 +439,6 @@ def upload_attachment(
         logger.error("Failed to create Attachment: %d %s", resp.status_code, resp.text)
         raise RuntimeError(f"OData Attachment creation failed with status {resp.status_code}: {resp.text}")
 
-    # Extract Attachment ID from response body or headers
     resp_data = {}
     try:
         resp_data = resp.json()
@@ -467,7 +447,6 @@ def upload_attachment(
 
     attachment_id = None
 
-    # Check JSON response body
     if resp_data:
         d_obj = resp_data.get("d", resp_data)
         if isinstance(d_obj, dict):
@@ -478,13 +457,11 @@ def upload_attachment(
             elif "key" in d_obj:
                 attachment_id = parse_attachment_id(d_obj["key"])
 
-    # Check Location header or other headers if body did not contain ID
     if not attachment_id:
         location_header = resp.headers.get("Location") or resp.headers.get("location")
         if location_header:
             attachment_id = parse_attachment_id(location_header)
 
-    # Fallback to parsing raw response text
     if not attachment_id and resp.text:
         attachment_id = parse_attachment_id(resp.text)
 
@@ -501,15 +478,7 @@ def update_application_snapshot(
     client: Optional[SFClient] = None,
     target_field: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Link the new attachment to the Job Application's custom resume field.
-    
-    Executes PATCH /odata/v2/JobApplication('{app_id}') with fallback to MERGE / upsert.
-    
-    Payload:
-      {
-        "Cust_Candidate_Resume": "<attachmentId>"
-      }
-    """
+    """Link the new attachment to the Job Application's custom resume field."""
     sf = client or SFClient()
     application_id_str = str(app_id).strip()
     attach_id_str = str(attachment_id).strip()
@@ -527,11 +496,8 @@ def update_application_snapshot(
     }
 
     endpoint = f"JobApplication('{application_id_str}')"
-    
-    # Try PATCH first
     resp = sf.request("PATCH", endpoint, json_data=payload)
 
-    # If PATCH method is not supported (e.g. 405 Method Not Allowed), try MERGE or POST upsert
     if resp.status_code == 405:
         logger.info("PATCH returned 405. Trying MERGE on %s", endpoint)
         resp = sf.request("MERGE", endpoint, json_data=payload)
@@ -564,24 +530,7 @@ def orchestrate_resume_snapshot(
     app_id: str,
     client: Optional[SFClient] = None,
 ) -> Dict[str, Any]:
-    """Orchestrate the guarded resume snapshot copy for a single candidate/application pair.
-    
-    Enforces business rules:
-      1. Guard: Check if JobApplication.Cust_Candidate_Resume is already populated.
-         If yes -> Skip without modifying (Write-Once Idempotent guarantee).
-      2. Source: Read candidate's current resume from Candidate Profile.
-         If candidate has no resume -> Skip gracefully.
-      3. Attachment: Create a new independent Attachment entity with the candidate's resume content.
-      4. Target Link: Link the new Attachment ID to the Job Application's Cust_Candidate_Resume.
-      
-    Returns:
-      Dict with status code, message, and metadata:
-        - "status": "SUCCESS" | "SKIPPED_ALREADY_EXISTS" | "SKIPPED_NO_RESUME" | "ERROR"
-        - "message": Human-readable description
-        - "application_id": str
-        - "candidate_id": str
-        - "attachment_id": Optional[str]
-    """
+    """Orchestrate the guarded resume snapshot copy for a single candidate/application pair (Phase 1)."""
     sf = client or SFClient()
     candidate_id_str = str(candidate_id).strip()
     app_id_str = str(app_id).strip()
@@ -593,7 +542,6 @@ def orchestrate_resume_snapshot(
     )
 
     try:
-        # Step 1: Guard Check on JobApplication
         app_status = get_application_snapshot_status(app_id_str, client=sf)
         
         if app_status.get("is_populated"):
@@ -611,7 +559,6 @@ def orchestrate_resume_snapshot(
                 "attachment_id": existing_attach_id,
             }
 
-        # Step 2: Read Candidate's Current Resume
         candidate_resume = get_candidate_resume(candidate_id_str, client=sf)
         
         if not candidate_resume or not candidate_resume.get("fileContent"):
@@ -628,8 +575,6 @@ def orchestrate_resume_snapshot(
                 "attachment_id": None,
             }
 
-        # Step 3: Create Independent Attachment Object
-        # Format snapshot filename cleanly to indicate application context
         orig_filename = candidate_resume.get("fileName", "resume.pdf")
         snapshot_filename = f"Snapshot_App_{app_id_str}_{orig_filename}"
         
@@ -640,7 +585,6 @@ def orchestrate_resume_snapshot(
             client=sf,
         )
 
-        # Step 4: Link New Attachment to Job Application
         update_application_snapshot(
             app_id=app_id_str,
             attachment_id=new_attachment_id,
@@ -671,3 +615,399 @@ def orchestrate_resume_snapshot(
             "candidate_id": candidate_id_str,
             "attachment_id": None,
         }
+
+
+# ============================================================================
+# Phase 2: Batch Discovery, Watermark, Processing & CSV Logging
+# ============================================================================
+
+def format_odata_timestamp_filter(timestamp_str: str) -> str:
+    """Format an ISO timestamp into an OData v2 compatible filter expression."""
+    clean_ts = timestamp_str.strip()
+    if clean_ts.startswith("datetimeoffset'") or clean_ts.startswith("datetime'"):
+        return f"applicationDate gt {clean_ts}"
+    # Standard format: applicationDate gt datetimeoffset'YYYY-MM-DDTHH:MM:SSZ' or datetime'...'
+    if "T" in clean_ts:
+        return f"applicationDate gt datetimeoffset'{clean_ts}'"
+    return f"applicationDate gt '{clean_ts}'"
+
+
+def discover_applications(
+    last_run_timestamp: str,
+    client: Optional[SFClient] = None,
+    page_size: int = 1000,
+    target_field: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Discover Job Applications created/modified since lastRunTimestamp with pagination.
+    
+    OData Query:
+      GET /odata/v2/JobApplication
+          ?$filter=applicationDate gt '{lastRunTimestamp}'
+          &$select=applicationId,candidateId,Cust_Candidate_Resume
+          &$top=1000&$skip={n}
+          
+    Paginates until an empty result set is returned.
+    """
+    sf = client or SFClient()
+    field_name = target_field or sf.config.target_resume_field
+    all_applications: List[Dict[str, Any]] = []
+    skip = 0
+
+    filter_expr = format_odata_timestamp_filter(last_run_timestamp)
+    logger.info("Starting discovery for JobApplications with filter: %s (page_size=%d)", filter_expr, page_size)
+
+    while True:
+        params = {
+            "$filter": filter_expr,
+            "$select": f"applicationId,candidateId,{field_name}",
+            "$top": page_size,
+            "$skip": skip,
+        }
+
+        resp = sf.request("GET", "JobApplication", params=params)
+
+        if resp.status_code != 200:
+            # If datetimeoffset filter syntax caused error, fallback to simple quoted or datetime filter
+            if resp.status_code in (400, 500) and "datetimeoffset" in filter_expr:
+                logger.info("Retrying discovery using standard datetime'...' syntax...")
+                clean_iso = last_run_timestamp.replace("Z", "")
+                filter_expr = f"applicationDate gt datetime'{clean_iso}'"
+                params["$filter"] = filter_expr
+                resp = sf.request("GET", "JobApplication", params=params)
+
+            if resp.status_code != 200:
+                logger.error("JobApplication discovery failed at skip=%d: %d %s", skip, resp.status_code, resp.text)
+                raise RuntimeError(f"OData discovery query failed with status {resp.status_code}: {resp.text}")
+
+        data = resp.json()
+        results = data.get("d", {}).get("results", [])
+        
+        if not results:
+            logger.info("Discovery reached end of stream at skip=%d. Total applications found: %d", skip, len(all_applications))
+            break
+
+        all_applications.extend(results)
+        logger.info("Discovered %d applications in current page (Total so far: %d)", len(results), len(all_applications))
+
+        if len(results) < page_size:
+            # Reached last page
+            break
+
+        skip += page_size
+
+    return all_applications
+
+
+def process_application(
+    app: Dict[str, Any],
+    run_timestamp: Optional[str] = None,
+    client: Optional[SFClient] = None,
+    target_field: Optional[str] = None,
+) -> Dict[str, str]:
+    """Process a single Job Application record per the write-once guard rule.
+    
+    Logic:
+      if Cust_Candidate_Resume is not empty:
+          status = SKIPPED_ALREADY_SET
+      else:
+          resume = get_candidate_resume(candidateId)
+          if resume is None:
+              status = SKIPPED_NO_RESUME
+          else:
+              try:
+                  attachment_id = upload_attachment(resume.fileContent, resume.fileName)
+                  update_application_snapshot(applicationId, attachment_id)
+                  status = SUCCESS
+              except Exception as e:
+                  status = FAILED, errorMessage = str(e)
+                  
+    Returns:
+      A CSV log row dictionary:
+        {
+          "runTimestamp": str,
+          "applicationId": str,
+          "candidateId": str,
+          "status": "SUCCESS" | "SKIPPED_ALREADY_SET" | "SKIPPED_NO_RESUME" | "FAILED",
+          "attachmentId": str,
+          "errorMessage": str
+        }
+    """
+    sf = client or SFClient()
+    current_run_ts = run_timestamp or datetime.now(timezone.utc).isoformat()
+    field_name = target_field or sf.config.target_resume_field
+
+    app_id = str(app.get("applicationId") or "").strip()
+    cand_id = str(app.get("candidateId") or "").strip()
+    raw_custom_resume = app.get(field_name)
+
+    is_populated, existing_id = is_attachment_populated(raw_custom_resume)
+
+    # 1. Guard Check: Is snapshot already set?
+    if is_populated:
+        logger.info("JobApplication %s already has Cust_Candidate_Resume set (Attachment ID: %s). Skipping.", app_id, existing_id)
+        return {
+            "runTimestamp": current_run_ts,
+            "applicationId": app_id,
+            "candidateId": cand_id,
+            "status": "SKIPPED_ALREADY_SET",
+            "attachmentId": "",
+            "errorMessage": "",
+        }
+
+    # 2. Check Candidate Resume
+    try:
+        candidate_resume = get_candidate_resume(cand_id, client=sf)
+    except Exception as ex:
+        logger.warning("Error fetching candidate resume for %s: %s", cand_id, ex)
+        return {
+            "runTimestamp": current_run_ts,
+            "applicationId": app_id,
+            "candidateId": cand_id,
+            "status": "FAILED",
+            "attachmentId": "",
+            "errorMessage": f"Failed fetching candidate resume: {str(ex)}",
+        }
+
+    if candidate_resume is None or not candidate_resume.get("fileContent"):
+        logger.info("Candidate %s has no resume. Skipping JobApplication %s.", cand_id, app_id)
+        return {
+            "runTimestamp": current_run_ts,
+            "applicationId": app_id,
+            "candidateId": cand_id,
+            "status": "SKIPPED_NO_RESUME",
+            "attachmentId": "",
+            "errorMessage": "",
+        }
+
+    # 3. Create independent attachment and link to JobApplication
+    try:
+        orig_filename = candidate_resume.get("fileName", "resume.pdf")
+        snapshot_filename = f"Snapshot_App_{app_id}_{orig_filename}"
+
+        new_attach_id = upload_attachment(
+            base64_content=candidate_resume["fileContent"],
+            filename=snapshot_filename,
+            module="RECRUITING",
+            client=sf,
+        )
+
+        update_application_snapshot(
+            app_id=app_id,
+            attachment_id=new_attach_id,
+            client=sf,
+            target_field=field_name,
+        )
+
+        logger.info("Successfully created and linked snapshot attachment %s to JobApplication %s", new_attach_id, app_id)
+        return {
+            "runTimestamp": current_run_ts,
+            "applicationId": app_id,
+            "candidateId": cand_id,
+            "status": "SUCCESS",
+            "attachmentId": new_attach_id,
+            "errorMessage": "",
+        }
+
+    except Exception as ex:
+        err_msg = str(ex)
+        logger.error("Failed snapshot copy for application %s: %s", app_id, err_msg)
+        return {
+            "runTimestamp": current_run_ts,
+            "applicationId": app_id,
+            "candidateId": cand_id,
+            "status": "FAILED",
+            "attachmentId": "",
+            "errorMessage": err_msg,
+        }
+
+
+def write_csv_log(
+    rows: List[Dict[str, str]],
+    run_timestamp: str,
+    log_dir: str = "logs",
+) -> str:
+    """Write per-run flat CSV log file.
+    
+    Naming: resume_snapshot_log_{safe_run_timestamp}.csv
+    Columns: runTimestamp, applicationId, candidateId, status, attachmentId, errorMessage
+    """
+    os.makedirs(log_dir, exist_ok=True)
+    safe_ts = run_timestamp.replace(":", "-").replace(".", "-").replace("+", "_")
+    filename = f"resume_snapshot_log_{safe_ts}.csv"
+    filepath = os.path.join(log_dir, filename)
+
+    fieldnames = ["runTimestamp", "applicationId", "candidateId", "status", "attachmentId", "errorMessage"]
+
+    logger.info("Writing %d application log rows to CSV: %s", len(rows), filepath)
+    with open(filepath, mode="w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({
+                "runTimestamp": row.get("runTimestamp", run_timestamp),
+                "applicationId": row.get("applicationId", ""),
+                "candidateId": row.get("candidateId", ""),
+                "status": row.get("status", ""),
+                "attachmentId": row.get("attachmentId", ""),
+                "errorMessage": row.get("errorMessage", ""),
+            })
+
+    return filepath
+
+
+def append_run_summary(
+    summary_row: Dict[str, Any],
+    summary_filepath: str = "resume_snapshot_run_summary.csv",
+) -> str:
+    """Append a one-line run summary to the cumulative summary CSV file.
+    
+    Columns: runTimestamp, applicationsFound, succeeded, skippedAlreadySet, skippedNoResume, failed, runStatus
+    """
+    file_exists = os.path.exists(summary_filepath)
+    fieldnames = [
+        "runTimestamp",
+        "applicationsFound",
+        "succeeded",
+        "skippedAlreadySet",
+        "skippedNoResume",
+        "failed",
+        "runStatus",
+    ]
+
+    logger.info("Appending run summary to cumulative file: %s", summary_filepath)
+    with open(summary_filepath, mode="a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists or os.path.getsize(summary_filepath) == 0:
+            writer.writeheader()
+        
+        writer.writerow({
+            "runTimestamp": summary_row.get("runTimestamp", ""),
+            "applicationsFound": summary_row.get("applicationsFound", 0),
+            "succeeded": summary_row.get("succeeded", 0),
+            "skippedAlreadySet": summary_row.get("skippedAlreadySet", 0),
+            "skippedNoResume": summary_row.get("skippedNoResume", 0),
+            "failed": summary_row.get("failed", 0),
+            "runStatus": summary_row.get("runStatus", "COMPLETED"),
+        })
+
+    return summary_filepath
+
+
+def get_watermark(
+    watermark_file: str = "watermark.txt",
+    default_timestamp: str = "1970-01-01T00:00:00Z",
+) -> str:
+    """Read the last successful run's start timestamp from the watermark file."""
+    if os.path.exists(watermark_file):
+        try:
+            with open(watermark_file, "r", encoding="utf-8") as f:
+                val = f.read().strip()
+                if val:
+                    logger.info("Read existing watermark timestamp: %s", val)
+                    return val
+        except Exception as ex:
+            logger.warning("Could not read watermark file %s (%s). Using default.", watermark_file, ex)
+    
+    logger.info("No existing watermark found. Using initial watermark: %s", default_timestamp)
+    return default_timestamp
+
+
+def save_watermark(
+    timestamp_str: str,
+    watermark_file: str = "watermark.txt",
+) -> None:
+    """Save the new watermark timestamp after a successful batch run."""
+    logger.info("Advancing watermark to: %s in %s", timestamp_str, watermark_file)
+    with open(watermark_file, "w", encoding="utf-8") as f:
+        f.write(timestamp_str.strip() + "\n")
+
+
+def run(
+    client: Optional[SFClient] = None,
+    watermark_file: str = "watermark.txt",
+    log_dir: str = "logs",
+    summary_file: str = "resume_snapshot_run_summary.csv",
+    lookback_override: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Execute the Phase 2 scheduled batch process with watermark management and CSV logging.
+    
+    Flow:
+      1. Capture runTimestamp (run start time in UTC).
+      2. Read lastRunTimestamp from watermark file.
+      3. Discover Job Applications created since lastRunTimestamp (paginated).
+      4. Process each application with the write-once guard.
+      5. Generate per-run CSV log and append cumulative run summary.
+      6. Advance watermark ONLY if runStatus is COMPLETED (never on ERRORED).
+    """
+    sf = client or SFClient()
+    
+    # 1. Capture run start time
+    run_start_timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    logger.info("=== Starting Batch Integration Run at %s ===", run_start_timestamp)
+
+    # 2. Read lastRunTimestamp
+    last_run_timestamp = lookback_override or get_watermark(watermark_file=watermark_file)
+    logger.info("Processing window: applicationDate > %s", last_run_timestamp)
+
+    rows: List[Dict[str, str]] = []
+    succeeded = 0
+    skipped_already_set = 0
+    skipped_no_resume = 0
+    failed = 0
+    run_status = "COMPLETED"
+
+    try:
+        # 3. Discovery Query (Paginated)
+        apps = discover_applications(last_run_timestamp=last_run_timestamp, client=sf)
+        applications_found = len(apps)
+        logger.info("Discovered %d applications to process.", applications_found)
+
+        # 4. Per-Application Processing Loop
+        for app in apps:
+            row = process_application(app=app, run_timestamp=run_start_timestamp, client=sf)
+            rows.append(row)
+            
+            st = row.get("status")
+            if st == "SUCCESS":
+                succeeded += 1
+            elif st == "SKIPPED_ALREADY_SET":
+                skipped_already_set += 1
+            elif st == "SKIPPED_NO_RESUME":
+                skipped_no_resume += 1
+            elif st == "FAILED":
+                failed += 1
+
+    except Exception as batch_err:
+        logger.exception("Fatal batch error during application discovery/processing: %s", batch_err)
+        run_status = "ERRORED"
+        applications_found = len(rows)
+
+    # 5. Write per-run flat CSV log
+    csv_log_path = write_csv_log(rows=rows, run_timestamp=run_start_timestamp, log_dir=log_dir)
+
+    # 6. Append to cumulative summary CSV
+    summary_data = {
+        "runTimestamp": run_start_timestamp,
+        "applicationsFound": applications_found,
+        "succeeded": succeeded,
+        "skippedAlreadySet": skipped_already_set,
+        "skippedNoResume": skipped_no_resume,
+        "failed": failed,
+        "runStatus": run_status,
+    }
+    append_run_summary(summary_row=summary_data, summary_filepath=summary_file)
+
+    # 7. Advance watermark ONLY on COMPLETED
+    if run_status == "COMPLETED":
+        save_watermark(timestamp_str=run_start_timestamp, watermark_file=watermark_file)
+        logger.info("Batch run COMPLETED successfully. Watermark advanced to %s", run_start_timestamp)
+    else:
+        logger.warning("Batch run ended in ERRORED state. Watermark preserved at %s for safe retry.", last_run_timestamp)
+
+    summary_data["csvLogPath"] = csv_log_path
+    summary_data["summaryFilePath"] = summary_file
+    summary_data["watermarkAdvanced"] = (run_status == "COMPLETED")
+
+    logger.info("=== Batch Run Finished: Status=%s (Found: %d, Succeeded: %d, SkippedSet: %d, SkippedNoResume: %d, Failed: %d) ===",
+                run_status, applications_found, succeeded, skipped_already_set, skipped_no_resume, failed)
+    return summary_data

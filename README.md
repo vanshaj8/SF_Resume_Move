@@ -114,7 +114,7 @@ Appended to on each run to track high-level batch health over time:
 
 ---
 
-## Setup & Execution Guide
+## Setup & Configuration
 
 ### 1. Installation
 ```bash
@@ -136,31 +136,215 @@ SF_USERNAME=your_api_username
 SF_PASSWORD=your_api_password
 ```
 
-### 3. Run Scheduled Batch Processing (Phase 2 Default)
+---
+
+## Demo Run Scenarios & Output Examples
+
+Below are concrete execution examples and expected outputs for every operational scenario:
+
+### Scenario 1: Scheduled Batch Run (Phase 2 Default)
+Discovers all applications created/modified since the last watermark, enforces write-once guards, clones attachments, updates watermarks, and writes CSV logs.
+
+**Command:**
 ```bash
-# Run batch discovery with automatic watermark advancement
 python3 main.py --batch
-
-# Run batch with custom lookback start time
-python3 main.py --since 2026-08-25T00:00:00Z
-
-# Run with custom watermark file
-python3 main.py --watermark-file /path/to/watermark.txt
 ```
 
-### 4. Run Single Application Test (Phase 1 Test Case)
+**Example Terminal Output:**
+```text
+==============================================================================
+SAP SuccessFactors Recruiting: Candidate Resume Snapshot Integration
+==============================================================================
+Environment:       https://api44preview.sapsf.com
+Target Field:      Cust_Candidate_Resume
+Mode:              Scheduled Batch Discovery & Processing
+Watermark File:    watermark.txt
+==============================================================================
+
+[Action] Executing Batch Engine...
+[2026-08-25 14:00:00] [INFO] [sf_resume_snapshot]: === Starting Batch Integration Run at 2026-08-25T14:00:00Z ===
+[2026-08-25 14:00:00] [INFO] [sf_resume_snapshot]: Processing window: applicationDate > 2026-08-25T13:00:00Z
+[2026-08-25 14:00:01] [INFO] [sf_resume_snapshot]: Discovered 4 applications in current page (Total so far: 4)
+[2026-08-25 14:00:02] [INFO] [sf_resume_snapshot]: Successfully created and linked snapshot attachment 98231 to JobApplication 547901
+[2026-08-25 14:00:02] [INFO] [sf_resume_snapshot]: JobApplication 547902 already has Cust_Candidate_Resume set (Attachment ID: 88120). Skipping.
+[2026-08-25 14:00:03] [INFO] [sf_resume_snapshot]: Candidate 1104829 has no resume. Skipping JobApplication 547903.
+[2026-08-25 14:00:04] [INFO] [sf_resume_snapshot]: Batch run COMPLETED successfully. Watermark advanced to 2026-08-25T14:00:00Z
+
+==============================================================================
+Batch Run Summary:
+==============================================================================
+{
+  "runTimestamp": "2026-08-25T14:00:00Z",
+  "applicationsFound": 4,
+  "succeeded": 1,
+  "skippedAlreadySet": 1,
+  "skippedNoResume": 1,
+  "failed": 1,
+  "runStatus": "COMPLETED",
+  "csvLogPath": "logs/resume_snapshot_log_2026-08-25T14-00-00Z.csv",
+  "summaryFilePath": "resume_snapshot_run_summary.csv",
+  "watermarkAdvanced": true
+}
+
+✅ Batch run completed. Log written to: logs/resume_snapshot_log_2026-08-25T14-00-00Z.csv
+```
+
+**Generated Per-Run CSV Log (`logs/resume_snapshot_log_2026-08-25T14-00-00Z.csv`):**
+```csv
+runTimestamp,applicationId,candidateId,status,attachmentId,errorMessage
+2026-08-25T14:00:00Z,547901,1104827,SUCCESS,98231,
+2026-08-25T14:00:00Z,547902,1104828,SKIPPED_ALREADY_SET,,
+2026-08-25T14:00:00Z,547903,1104829,SKIPPED_NO_RESUME,,
+2026-08-25T14:00:00Z,547904,1104830,FAILED,,HTTP 500: Attachment upload failed
+```
+
+**Cumulative Run Summary (`resume_snapshot_run_summary.csv`):**
+```csv
+runTimestamp,applicationsFound,succeeded,skippedAlreadySet,skippedNoResume,failed,runStatus
+2026-08-25T13:00:00Z,10,6,2,2,0,COMPLETED
+2026-08-25T14:00:00Z,4,1,1,1,1,COMPLETED
+```
+
+---
+
+### Scenario 2: Single Application Test (Phase 1 Test Case)
+Runs the guarded copy for a single Candidate and Job Application pair.
+
+**Command:**
 ```bash
 python3 main.py --single --candidate-id 1104827 --application-id 547901
 ```
 
-### 5. Inspect Live OData `$metadata`
+**Example Output (New Snapshot Created):**
+```text
+==============================================================================
+SAP SuccessFactors Recruiting: Candidate Resume Snapshot Integration
+==============================================================================
+Environment:       https://api44preview.sapsf.com
+Target Field:      Cust_Candidate_Resume
+Mode:              Single Application Test
+Candidate ID:      1104827
+Job Application ID:547901
+==============================================================================
+
+[Action] Running Guarded Resume Snapshot for single application...
+[2026-08-25 14:05:00] [INFO] [sf_resume_snapshot]: Application 547901 Snapshot Status: is_populated=False, current_attachment_id=None
+[2026-08-25 14:05:01] [INFO] [sf_resume_snapshot]: Found Candidate resume: fileName='Kavita_Resume.pdf', size=154200 base64 chars
+[2026-08-25 14:05:02] [INFO] [sf_resume_snapshot]: Successfully created Attachment with plain ID: 98231
+[2026-08-25 14:05:03] [INFO] [sf_resume_snapshot]: Successfully linked Attachment 98231 to JobApplication 547901
+
+==============================================================================
+Execution Result Summary:
+==============================================================================
+{
+  "status": "SUCCESS",
+  "message": "Successfully captured resume snapshot from Candidate 1104827 and linked Attachment 98231 to JobApplication 547901.",
+  "application_id": "547901",
+  "candidate_id": "1104827",
+  "attachment_id": "98231",
+  "filename": "Snapshot_App_547901_Kavita_Resume.pdf"
+}
+
+✅ Resume snapshot successfully cloned and attached to Job Application.
+```
+
+**Example Output (When Write-Once Guard Triggers on Re-Run):**
+```text
+==============================================================================
+Execution Result Summary:
+==============================================================================
+{
+  "status": "SKIPPED_ALREADY_EXISTS",
+  "message": "Write-once guard triggered: JobApplication 547901 already has a frozen snapshot linked (Attachment ID: 98231). Preserving existing snapshot without overwrite.",
+  "application_id": "547901",
+  "candidate_id": "1104827",
+  "attachment_id": "98231"
+}
+
+ℹ️  Process completed safely (SKIPPED_ALREADY_EXISTS): Write-once guard triggered
+```
+
+---
+
+### Scenario 3: Batch Run with Custom Lookback Date (`--since`)
+Allows manually specifying the discovery timestamp rather than reading from `watermark.txt`.
+
+**Command:**
+```bash
+python3 main.py --since 2026-08-25T00:00:00Z
+```
+
+**Example Terminal Output:**
+```text
+==============================================================================
+SAP SuccessFactors Recruiting: Candidate Resume Snapshot Integration
+==============================================================================
+Environment:       https://api44preview.sapsf.com
+Target Field:      Cust_Candidate_Resume
+Mode:              Scheduled Batch Discovery & Processing
+Watermark File:    watermark.txt
+Lookback Override: 2026-08-25T00:00:00Z
+==============================================================================
+
+[Action] Executing Batch Engine...
+[2026-08-25 14:10:00] [INFO] [sf_resume_snapshot]: Processing window: applicationDate > 2026-08-25T00:00:00Z
+[2026-08-25 14:10:02] [INFO] [sf_resume_snapshot]: Discovered 12 applications to process.
+```
+
+---
+
+### Scenario 4: Live Tenant Schema Inspection (`--inspect-metadata`)
+Queries `$metadata` to verify attachment payload fields and custom resume field names.
+
+**Command:**
 ```bash
 python3 main.py --inspect-metadata
 ```
 
-### 6. Run Automated Tests
+**Example Output:**
+```json
+{
+  "attachment_content_field": "fileContent",
+  "target_field_present": true,
+  "raw_metadata_length": 845210
+}
+```
+
+---
+
+### Scenario 5: Automated Unit & Integration Tests
+Runs all 16 mocked unit and integration tests covering positive flows, write-once skips, pagination, and error isolation.
+
+**Command:**
 ```bash
 pytest test_integration.py -v
+```
+
+**Example Output:**
+```text
+============================= test session starts ==============================
+platform darwin -- Python 3.12.2, pytest-9.1.1
+rootdir: /Users/vanshajsharma/MoveResume
+collected 16 items
+
+test_integration.py::test_parse_attachment_id_variations PASSED          [  6%]
+test_integration.py::test_parse_attachment_id_invalid PASSED             [ 12%]
+test_integration.py::test_get_candidate_resume_success PASSED            [ 18%]
+test_integration.py::test_get_candidate_resume_no_resume PASSED          [ 25%]
+test_integration.py::test_upload_attachment_success PASSED               [ 31%]
+test_integration.py::test_update_application_snapshot_success PASSED     [ 37%]
+test_integration.py::test_discover_applications_paginated PASSED         [ 43%]
+test_integration.py::test_process_application_skipped_already_set PASSED [ 50%]
+test_integration.py::test_process_application_skipped_no_resume PASSED   [ 56%]
+test_integration.py::test_process_application_success PASSED             [ 62%]
+test_integration.py::test_process_application_failed_error_isolation PASSED [ 68%]
+test_integration.py::test_write_csv_log PASSED                           [ 75%]
+test_integration.py::test_append_run_summary PASSED                      [ 81%]
+test_integration.py::test_watermark_lifecycle PASSED                     [ 87%]
+test_integration.py::test_run_batch_advances_watermark_on_completed PASSED [ 93%]
+test_integration.py::test_run_batch_preserves_watermark_on_errored PASSED [100%]
+
+============================== 16 passed in 0.18s ==============================
 ```
 
 ---
